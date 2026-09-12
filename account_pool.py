@@ -1,3 +1,5 @@
+# Copyright 2026 perplexity-to-openai contributors
+
 """Load-balanced pool of Perplexity accounts from a Netscape cookie file.
 
 accounts.txt holds any number of account blocks:
@@ -15,10 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, TypedDict
+from pathlib import Path
+from typing import Any, TypedDict
 
 from pplx_transport import PerplexityClient
 
@@ -27,15 +29,40 @@ log = logging.getLogger("pplx.accounts")
 QUOTA_TTL = 120.0  # rate-limit/status cache
 COOLDOWN = 300.0  # after consecutive failures
 FAIL_THRESHOLD = 3  # consecutive failures -> cooldown
+NETSCAPE_MIN_COLUMNS = 7  # domain, flag, path, secure, expiry, name, value
 
 
 class AccountSpec(TypedDict):
+    """Cookies and label for a single account block.
+
+    Attributes:
+        label: Display label parsed from the account header line.
+        cookies: Cookie name to value mapping for the account.
+
+    """
+
     label: str
     cookies: dict[str, str]
 
 
 @dataclass
 class Account:
+    """One pooled Perplexity account and its health state.
+
+    Attributes:
+        index: Position of the account within the pool.
+        label: Display label parsed from the account header line.
+        cookies: Cookie name to value mapping for the session.
+        client: Transport client bound to this account's cookies.
+        active: Number of requests currently using the account.
+        consecutive_failures: Failure count since the last success.
+        cooldown_until: Epoch time until which the account is skipped.
+        quota_known: Last known quota flag, or None when unknown.
+        quota_checked_at: Epoch time of the last quota refresh.
+        last_error: Human-readable reason for the last failure, if any.
+
+    """
+
     index: int
     label: str
     cookies: dict[str, str]
@@ -43,23 +70,36 @@ class Account:
     active: int = 0
     consecutive_failures: int = 0
     cooldown_until: float = 0.0
-    quota_known: Optional[bool] = None
+    quota_known: bool | None = None
     quota_checked_at: float = 0.0
-    last_error: Optional[str] = None
+    last_error: str | None = None
 
     def healthy(self, now: float) -> bool:
-        if now < self.cooldown_until:
-            return False
-        if self.quota_known is False:
-            return False
-        return True
+        """Check whether the account may receive new work.
+
+        Args:
+            now: Current time in seconds since the epoch.
+
+        Returns:
+            True when the account is neither cooling down nor quota-exhausted.
+
+        """
+        return now >= self.cooldown_until and self.quota_known is not False
 
 
 def parse_accounts(path: str) -> list[AccountSpec]:
-    """Parse the Netscape-cookie account file into cookie dicts."""
+    """Parse the Netscape-cookie account file into cookie dicts.
+
+    Args:
+        path: Filesystem path of the accounts file to read.
+
+    Returns:
+        Specs for every account block that yielded at least one cookie.
+
+    """
     accounts: list[AccountSpec] = []
     current: AccountSpec | None = None
-    with open(path, "r", encoding="utf-8") as fh:
+    with Path(path).open(encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
             if not line:
@@ -71,36 +111,60 @@ def parse_accounts(path: str) -> list[AccountSpec]:
             if current is None or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) < 7:
+            if len(parts) < NETSCAPE_MIN_COLUMNS:
                 continue
             current["cookies"][parts[5]] = parts[6]
     return [a for a in accounts if a["cookies"]]
 
 
 class AccountPool:
-    def __init__(self, path: str, *, max_concurrent: int = 2):
+    """Round-robin pool of Perplexity accounts backed by a cookie file.
+
+    The pool reloads the file when its mtime changes and steers new work to
+    the least-loaded healthy account.
+
+    Attributes:
+        path: Filesystem path of the Netscape-cookie accounts file.
+        max_concurrent: Maximum concurrent sessions per account.
+
+    """
+
+    def __init__(self, path: str, *, max_concurrent: int = 2) -> None:
+        """Initialize the pool.
+
+        Args:
+            path: Filesystem path of the Netscape-cookie accounts file.
+            max_concurrent: Maximum concurrent sessions per account.
+
+        """
         self.path = path
         self.max_concurrent = max_concurrent
         self._accounts: list[Account] = []
         self._rr = 0
-        self._mtime: Optional[float] = None
+        self._mtime: float | None = None
         self._semaphores: dict[int, asyncio.Semaphore] = {}
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
+        """Load accounts from disk into the pool."""
         await self.reload()
 
     async def reload(self) -> None:
+        """Reload the accounts file when its mtime changed.
+
+        Existing clients are kept for unchanged accounts so sessions are
+        reused; replaced accounts have their old client closed.
+        """
         try:
-            st = os.stat(self.path)
+            st = await asyncio.to_thread(Path(self.path).stat)
             if self._mtime == st.st_mtime and self._accounts:
                 return
             raw = parse_accounts(self.path)
         except FileNotFoundError:
-            log.error("accounts file missing: %s", self.path)
+            log.exception("accounts file missing: %s", self.path)
             return
-        except Exception as e:
-            log.error("failed to parse accounts: %s", e)
+        except (OSError, ValueError, RuntimeError):
+            log.exception("failed to parse accounts: %s", self.path)
             return
         async with self._lock:
             if (
@@ -128,7 +192,7 @@ class AccountPool:
                                 spec["cookies"],
                                 max_concurrent=self.max_concurrent,
                             ),
-                        )
+                        ),
                     )
             self._accounts = new_list
             self._semaphores = {
@@ -139,22 +203,42 @@ class AccountPool:
 
     @property
     def size(self) -> int:
+        """Number of accounts currently in the pool.
+
+        Returns:
+            Count of loaded accounts.
+
+        """
         return len(self._accounts)
 
-    async def _refresh_quota(self, acct: Account) -> None:
+    @staticmethod
+    async def _refresh_quota(acct: Account) -> None:
+        """Refresh the cached quota flag for one account.
+
+        Skips the check while the cached value is still fresh and records
+        failures at debug level so one slow status probe never breaks picks.
+
+        Args:
+            acct: Account whose quota flag should be refreshed.
+
+        """
         now = time.time()
         if now - acct.quota_checked_at < QUOTA_TTL:
             return
         try:
             acct.quota_known = await acct.client.quota_available()
             acct.quota_checked_at = now
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            log.debug("quota refresh failed: %s", exc)
 
-    async def pick(self) -> Optional[tuple[Account, asyncio.Semaphore]]:
-        """Pick the healthiest account (least active, round-robin tie-break).
+    async def pick(self) -> tuple[Account, asyncio.Semaphore] | None:
+        """Pick the healthiest account for new work.
 
-        Returns None when every account is unhealthy.
+        The least-loaded healthy account wins with a round-robin tie-break.
+
+        Returns:
+            Account and semaphore pair, or None when all accounts are unhealthy.
+
         """
         await self.reload()
         await asyncio.sleep(0)  # let pending health updates land
@@ -164,31 +248,55 @@ class AccountPool:
             if not candidates:
                 return None
             for a in candidates:
-                await self._refresh_quota(a)
+                await AccountPool._refresh_quota(a)
             candidates = [a for a in candidates if a.healthy(time.time())]
             if not candidates:
                 return None
             candidates.sort(
-                key=lambda a: (a.active, (a.index - self._rr) % len(self._accounts))
+                key=lambda a: (a.active, (a.index - self._rr) % len(self._accounts)),
             )
             self._rr = (self._rr + 1) % max(len(self._accounts), 1)
             acct = candidates[0]
             return acct, self._semaphores[acct.index]
 
-    def get(self, index: int) -> Optional[tuple[Account, asyncio.Semaphore]]:
-        """Return a specific account if it exists and is healthy."""
+    def get(self, index: int) -> tuple[Account, asyncio.Semaphore] | None:
+        """Return a specific account by index when it is healthy.
+
+        Args:
+            index: Position of the account in the pool.
+
+        Returns:
+            Account and semaphore pair, or None when missing or unhealthy.
+
+        """
         now = time.time()
         acct = self._accounts[index] if 0 <= index < len(self._accounts) else None
         if acct is None or not acct.healthy(now):
             return None
         return acct, self._semaphores[acct.index]
 
-    def record_success(self, acct: Account) -> None:
+    @staticmethod
+    def record_success(acct: Account) -> None:
+        """Mark an account request as successful.
+
+        Args:
+            acct: Account that completed a request successfully.
+
+        """
         acct.consecutive_failures = 0
         acct.last_error = None
         acct.quota_known = None  # re-check on next pick
 
-    def record_failure(self, acct: Account, error: str, *, quota: bool = False) -> None:
+    @staticmethod
+    def record_failure(acct: Account, error: str, *, quota: bool = False) -> None:
+        """Record a failed request against an account.
+
+        Args:
+            acct: Account that failed a request.
+            error: Human-readable failure reason for status reporting.
+            quota: Whether the failure signals quota exhaustion.
+
+        """
         acct.consecutive_failures += 1
         acct.last_error = error
         if quota:
@@ -200,6 +308,12 @@ class AccountPool:
             log.warning("account %d cooling down: %s", acct.index, error)
 
     def status(self) -> list[dict[str, Any]]:
+        """Summarize health state for every account.
+
+        Returns:
+            Per-account status dicts with load, health, quota, and error fields.
+
+        """
         now = time.time()
         return [
             {
@@ -215,5 +329,6 @@ class AccountPool:
         ]
 
     async def close(self) -> None:
+        """Close every account client session."""
         for a in self._accounts:
             await a.client.close()
