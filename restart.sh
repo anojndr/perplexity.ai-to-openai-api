@@ -37,7 +37,11 @@ else
 fi
 
 echo "Starting: $UVICORN server:app --host 0.0.0.0 --port $PORT"
-nohup "$UVICORN" server:app --host 0.0.0.0 --port "$PORT" >> "$LOG" 2>&1 &
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid "$UVICORN" server:app --host 0.0.0.0 --port "$PORT" </dev/null >> "$LOG" 2>&1 &
+else
+  nohup "$UVICORN" server:app --host 0.0.0.0 --port "$PORT" </dev/null >> "$LOG" 2>&1 &
+fi
 echo "Started in background (pid $!), log: $LOG"
 
 # --- 3. Wait for readiness --------------------------------------------------
@@ -51,6 +55,7 @@ for _ in $(seq 1 30); do
 done
 if [ -z "${UP:-}" ]; then
   echo "WARNING: not responding yet after 30s — check the log below."
+  exit 1
 fi
 
 # --- 4. Copy-paste tail command ---------------------------------------------
